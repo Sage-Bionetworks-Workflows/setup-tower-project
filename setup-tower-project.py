@@ -4,47 +4,56 @@ import argparse
 import configparser
 import json
 import os
-import yaml
 
 import boto3
 import requests
 
 
 REGION = "us-east-1"
-TOWER_ENDPOINT = "https://tower.nf/api"
 
 
 def main():
     args = parse_args()
-    conf = yaml.safe_load(args.config)
-    sess = configure_boto_session(conf)
+    sess = configure_boto_session(args)
     identity = get_caller_identity(sess)
-    proj_stack = retrieve_cfn_stack(sess, conf["stack_name"])
+    proj_stack = retrieve_cfn_stack(sess, args.stack_name)
     access_role_arn = get_project_role(identity, proj_stack)
-    configure_aws_profiles(proj_stack, identity, access_role_arn)
+    configure_aws_profiles(args, proj_stack, identity, access_role_arn)
     creds = get_forge_credentials(sess, proj_stack, identity, access_role_arn)
-    creds_id = configure_forge_credentials(conf, creds)
+    creds_id = configure_forge_credentials(args, creds)
     vpc_stack = retrieve_cfn_stack(sess, "nextflow-vpc")
-    configure_tower_compute_env(conf, proj_stack, creds_id, vpc_stack)
+    configure_tower_compute_env(args, proj_stack, creds_id, vpc_stack)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
     # TODO: Add option to skip AWS config profile creation
-    parser.add_argument("config", type=argparse.FileType("r"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stack_name", default=os.environ["STACK_NAME"])
+    parser.add_argument("--aws_access_key_id", default=os.environ["AWS_ACCESS_KEY_ID"])
+    parser.add_argument(
+        "--aws_secret_access_key", default=os.environ["AWS_SECRET_ACCESS_KEY"]
+    )
+    parser.add_argument("--aws_session_token", default=os.environ["AWS_SESSION_TOKEN"])
+    parser.add_argument("--nextflow_tower_token", default=os.environ["NXF_TOWER_TOKEN"])
+    parser.add_argument("--region", default=os.environ.get("REGION", "us-east-1"))
+    # TODO: Update with production endpoint once deployed
+    parser.add_argument(
+        "--tower_endpoint",
+        default=os.environ.get("NXF_TOWER_ENDPOINT", "https://tower.nf/api"),
+    )
     args = parser.parse_args()
     return args
 
 
-def configure_boto_session(config):
+def configure_boto_session(args):
     available_profiles = boto3.session.Session().available_profiles
     if "tower-user" in available_profiles:
         session = boto3.session.Session(profile_name="tower-user")
     else:
         session = boto3.session.Session(
-            config["aws_access_key_id"],
-            config["aws_secret_access_key"],
-            config["aws_session_token"],
+            args.aws_access_key_id,
+            args.aws_secret_access_key,
+            args.aws_session_token,
         )
     return session
 
@@ -86,7 +95,7 @@ def get_project_role(identity, stack):
     return access_role_arn
 
 
-def configure_aws_profiles(stack, identity, access_role_arn):
+def configure_aws_profiles(args, stack, identity, access_role_arn):
     aws_config_path = os.environ.get("AWS_CONFIG_FILE", "~/.aws/config")
     aws_config_path = os.path.expanduser(aws_config_path)
     aws_config_path = os.path.normpath(aws_config_path)
@@ -95,28 +104,23 @@ def configure_aws_profiles(stack, identity, access_role_arn):
     # Configure Tower user profile
     # TODO: Change from Viewer to TowerUser once JC role is available
     aws_config["profile tower-user"] = {
-        "region": "us-east-1",
+        "region": args.region,
         "output": "json",
         "sso_region": "us-east-1",
         "sso_account_id": "035458030717",
         "sso_start_url": "https://d-906769aa66.awsapps.com/start",
         "sso_role_name": "Viewer",
     }
-    print("Login into the `tower-user` profile with:")
-    print("    aws --profile tower-user sso login")
     # Configure Tower project profile
     stack_name = stack["StackName"]
     session_name = identity["SessionName"]
     aws_config[f"profile {stack_name}"] = {
-        "region": "us-east-1",
+        "region": args.region,
         "output": "json",
         "source_profile": "tower-user",
         "role_arn": access_role_arn,
         "role_session_name": session_name,
     }
-    bucket_name = stack["OutputsDict"]["TowerBucket"]
-    print(f"Then use the `{stack_name}` profile like this:")
-    print(f"    aws --profile {stack_name} s3 cp file.txt s3://{bucket_name}/")
     with open(aws_config_path, "w") as configfile:
         aws_config.write(configfile)
 
@@ -140,26 +144,26 @@ def get_forge_credentials(session, stack, identity, access_role_arn):
     return creds
 
 
-def make_tower_request(type, config, endpoint, data={}):
-    token = config["nextflow_tower_token"]
+def make_tower_request(type, endpoint, args, data={}):
+    token = args.nextflow_tower_token
     headers = {
         "Accept": "application/json, application/json",
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     request_fn = getattr(requests, type)
+    full_url = args.tower_endpoint + endpoint
     if type == "post":
-        response = request_fn(endpoint, json=data, headers=headers)
+        response = request_fn(full_url, json=data, headers=headers)
     else:
-        response = request_fn(endpoint, headers=headers)
+        response = request_fn(full_url, headers=headers)
     return response
 
 
-def configure_forge_credentials(config, credentials):
-    stack_name = config["stack_name"]
-    endpoint = f"{TOWER_ENDPOINT}/credentials"
+def configure_forge_credentials(args, credentials):
+    stack_name = args.stack_name
     # Check if credentials already exist for this stack
-    response = make_tower_request("get", config, endpoint)
+    response = make_tower_request("get", "/credentials", args)
     creds = response.json()["credentials"]
     for cred in creds:
         if cred["name"] == stack_name:
@@ -179,18 +183,17 @@ def configure_forge_credentials(config, credentials):
             "description": f"Credentials for {stack_name} project",
         }
     }
-    response = make_tower_request("post", config, endpoint, data)
+    response = make_tower_request("post", "/credentials", args, data)
     response_data = response.json()
     creds_id = response_data["credentialsId"]
     return creds_id
 
 
-def configure_tower_compute_env(config, stack, credentials_id, vpc_stack):
-    stack_name = config["stack_name"]
+def configure_tower_compute_env(args, stack, credentials_id, vpc_stack):
+    stack_name = args.stack_name
     bucket_name = stack["OutputsDict"]["TowerBucket"]
-    endpoint = f"{TOWER_ENDPOINT}/compute-envs/"
     # Check if compute environment already exist for this stack
-    response = make_tower_request("get", config, endpoint)
+    response = make_tower_request("get", "/compute-envs", args)
     comp_envs = response.json()["computeEnvs"]
     for comp_env in comp_envs:
         if comp_env["name"] == f"{stack_name} (default)":
@@ -211,7 +214,7 @@ def configure_tower_compute_env(config, stack, credentials_id, vpc_stack):
             "credentialsId": credentials_id,
             "config": {
                 "configMode": "Batch Forge",
-                "region": "us-east-1",
+                "region": args.region,
                 "workDir": f"s3://{bucket_name}/work",
                 "credentials": None,
                 "computeJobRole": None,
@@ -246,7 +249,7 @@ def configure_tower_compute_env(config, stack, credentials_id, vpc_stack):
             },
         }
     }
-    response = make_tower_request("post", config, endpoint, data)
+    response = make_tower_request("post", "/compute-envs", args, data)
     response_data = response.json()
     comp_env_id = response_data["computeEnvId"]
     return comp_env_id
