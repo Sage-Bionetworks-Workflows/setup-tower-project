@@ -9,9 +9,6 @@ import boto3
 import requests
 
 
-REGION = "us-east-1"
-
-
 def main():
     args = parse_args()
     sess = configure_boto_session(args)
