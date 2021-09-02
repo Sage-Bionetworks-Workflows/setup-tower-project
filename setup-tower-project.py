@@ -9,6 +9,10 @@ import boto3
 import requests
 
 
+# TODO: Update with production endpoint once deployed
+TOWER_ENDPOINT = "https://tower-dev.sagebionetworks.org/api"
+
+
 class TowerConfigurator:
     def __init__(
         self,
@@ -18,6 +22,7 @@ class TowerConfigurator:
         aws_session_token,
         nextflow_tower_token,
         synapse_token,
+        aws_config_path,
         region,
         tower_endpoint,
     ):
@@ -28,6 +33,7 @@ class TowerConfigurator:
         self.aws_session_token = aws_session_token
         self.nextflow_tower_token = nextflow_tower_token
         self.synapse_token = synapse_token
+        self.aws_config_path = aws_config_path
         self.region = region
         self.tower_endpoint = tower_endpoint
         # Perform additional setup
@@ -42,9 +48,11 @@ class TowerConfigurator:
 
     def configure(self):
         config = self.retrieve_config()
-        self.configure_tower_compute_env(config)
+        comp_env_id = self.configure_tower_compute_env(config)
         if self.caller_identity["Arn"] in config["read_write_arns"]:
             self.upload_synapse_config(config)
+        config["comp_env_id"] = comp_env_id
+        return config
 
     def configure_boto_session(
         self,
@@ -81,23 +89,35 @@ class TowerConfigurator:
         return config
 
     def configure_aws_profiles(self):
+        # Check if AWS CLI profiles already exist
         profiles = boto3.session.Session().available_profiles
-        if "sandbox" in profiles:
+        if "sandbox" in profiles and "tower" in profiles:
             return
-        aws_config_path = os.environ.get("AWS_CONFIG_FILE", "~/.aws/config")
-        aws_config_path = os.path.expanduser(aws_config_path)
-        aws_config_path = os.path.normpath(aws_config_path)
+        # Load AWS CLI configuration if need be
         aws_config = configparser.ConfigParser()
-        aws_config.read(aws_config_path)
-        aws_config["profile sandbox"] = {
-            "region": self.region,
-            "output": "json",
-            "sso_region": "us-east-1",
-            "sso_account_id": "563295687221",
-            "sso_start_url": "https://d-906769aa66.awsapps.com/start",
-            "sso_role_name": "Developer",
-        }
-        with open(aws_config_path, "w") as configfile:
+        aws_config.read(self.aws_config_path)
+        # Add 'sandbox' profile
+        if "sandbox" not in profiles:
+            aws_config["profile sandbox"] = {
+                "region": self.region,
+                "output": "json",
+                "sso_region": "us-east-1",
+                "sso_account_id": "563295687221",
+                "sso_start_url": "https://d-906769aa66.awsapps.com/start",
+                "sso_role_name": "Developer",
+            }
+        # Add 'tower' profile
+        if "tower" not in profiles:
+            aws_config["profile tower"] = {
+                "region": self.region,
+                "output": "json",
+                "sso_region": "us-east-1",
+                "sso_account_id": "728882028485",
+                "sso_start_url": "https://d-906769aa66.awsapps.com/start",
+                "sso_role_name": "TowerViewer",
+            }
+        # Export new profiles to disk`
+        with open(self.aws_config_path, "w") as configfile:
             aws_config.write(configfile)
 
     def make_tower_request(self, type, endpoint, data=None):
@@ -132,7 +152,7 @@ class TowerConfigurator:
                 "keys": {
                     "accessKey": config["forge_access_key_id"],
                     "secretKey": config["forge_secret_access_key"],
-                    "assumeRoleArn": None,
+                    "assumeRoleArn": config["forge_service_role_arn"],
                 },
                 "description": f"Credentials for {self.stack_name} project",
             }
@@ -148,12 +168,14 @@ class TowerConfigurator:
         response = self.make_tower_request("get", "/compute-envs")
         comp_envs = response.json()["computeEnvs"]
         for comp_env in comp_envs:
-            if comp_env["name"] == f"{args.stack_name} (default)":
-                assert comp_env["platform"] == "aws-batch"
-                assert (
+            if (
+                comp_env["name"] == f"{args.stack_name} (default)"
+                and comp_env["platform"] == "aws-batch"
+                and (
                     comp_env["status"] == "AVAILABLE"
                     or comp_env["status"] == "CREATING"
                 )
+            ):
                 return comp_env["id"]
         # If not, create it
         creds_id = self.configure_forge_credentials(config)
@@ -167,8 +189,8 @@ class TowerConfigurator:
                     "region": args.region,
                     "workDir": f"s3://{bucket_name}/work",
                     "credentials": None,
-                    "computeJobRole": None,
-                    "headJobRole": None,
+                    "computeJobRole": config["forge_work_role_arn"],
+                    "headJobRole": config["forge_head_role_arn"],
                     "headJobCpus": None,
                     "headJobMemoryMb": None,
                     "preRunScript": None,
@@ -229,17 +251,41 @@ def parse_args():
     parser.add_argument("--aws_session_token", default=os.environ["AWS_SESSION_TOKEN"])
     parser.add_argument("--nextflow_tower_token", default=os.environ["NXF_TOWER_TOKEN"])
     parser.add_argument("--synapse_token", default=os.environ["SYNAPSE_TOKEN"])
+    parser.add_argument(
+        "--aws_config_path", default=os.environ.get("AWS_CONFIG_FILE", "~/.aws/config")
+    )
     parser.add_argument("--region", default=os.environ.get("REGION", "us-east-1"))
-    # TODO: Update with production endpoint once deployed
     parser.add_argument(
         "--tower_endpoint",
-        default=os.environ.get("NXF_TOWER_ENDPOINT", "https://tower.nf/api"),
+        default=os.environ.get("NXF_TOWER_ENDPOINT", TOWER_ENDPOINT),
     )
     args = parser.parse_args()
+    args.aws_config_path = os.path.expanduser(args.aws_config_path)
+    args.aws_config_path = os.path.normpath(args.aws_config_path)
     return args
+
+
+def store_config(config, args):
+    aws_config_dir = os.path.dirname(args.aws_config_path)
+    output_dir = os.path.join(aws_config_dir, "tower-projects")
+    output_path = os.path.join(output_dir, f"{args.stack_name}.json")
+    prompt = f"\nSave configuration in '{output_path}'?\n[y]/n > "
+    response = input(prompt)
+    if response.lower().strip() in {"", "y", "yes", "true"}:
+        print("Saving...")
+        os.makedirs(output_dir, exist_ok=True)
+        with open(output_path, "w") as outfile:
+            if not isinstance(config, str):
+                config = json.dumps(config, sort_keys=True, indent=4)
+            outfile.write(config)
+    else:
+        print("Skipping...")
 
 
 if __name__ == "__main__":
     args = parse_args()
-    conf = TowerConfigurator(**vars(args))
-    conf.configure()
+    tower = TowerConfigurator(**vars(args))
+    config = tower.configure()
+    config_json = json.dumps(config, sort_keys=True, indent=4)
+    # store_config(config_json, args)
+    print(config_json)
