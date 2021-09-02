@@ -1,5 +1,9 @@
 FROM python:3.8.11
 
+LABEL org.opencontainers.image.authors="Bruno Grande <bruno.grande@sagebase.org>"
+LABEL org.opencontainers.image.vendor="Sage Bionetworks"
+LABEL org.opencontainers.image.url="https://github.com/Sage-Bionetworks-Workflows/setup-tower-project"
+
 WORKDIR /usr/src/app
 
 COPY Pipfile Pipfile.lock ./
