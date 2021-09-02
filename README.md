@@ -1,6 +1,6 @@
 # Setup Tower Projects
 
-The [`setup-tower-project.py`](setup-tower-project.py) script in this repository is intended to be use in conjunction with the [tower-project.yaml](https://github.com/Sage-Bionetworks-Workflows/aws-workflows-nextflow-infra/blob/main/templates/tower-project.yaml) template in [`aws-workflows-nextflow-infra`](https://github.com/Sage-Bionetworks-Workflows/aws-workflows-nextflow-infra). A Docker image is provided to minimize the burden of installing software dependencies.
+The [`setup-tower-project.py`](setup-tower-project.py) script in this repository is intended to be use in conjunction with the [`tower-project.yaml`](https://github.com/Sage-Bionetworks-Workflows/aws-workflows-nextflow-infra/blob/main/templates/tower-project.yaml) template in [`aws-workflows-nextflow-infra`](https://github.com/Sage-Bionetworks-Workflows/aws-workflows-nextflow-infra). A Docker image is provided to minimize the burden of installing software dependencies.
 
 ## Getting Started
 
